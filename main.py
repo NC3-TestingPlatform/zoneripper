@@ -193,6 +193,37 @@ def get_nsec_record(
 # ─────────────────────────────────────────────────────────────
 
 
+def is_valid_hostname_label(label: str) -> bool:
+    """
+    Return True if a DNS label looks like a real hostname component.
+    Rejects labels containing null bytes, non-printable characters,
+    or other synthetic patterns injected by some nameservers to
+    trap zone walkers (e.g. \\000, \\001, ...).
+    """
+    if not label:
+        return False
+    # Null-byte / escape sequences used by trap nameservers
+    if "\\000" in label or "\x00" in label:
+        return False
+    # Allow only printable ASCII that is valid in a hostname label
+    allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.*")
+    return all(c in allowed for c in label)
+
+
+def is_valid_zone_name(name: str, domain: str) -> bool:
+    """
+    Return True if *name* is a plausible real owner name inside *domain*.
+    Strips the domain suffix and validates every remaining label.
+    """
+    if name == domain:
+        return True
+    suffix = f".{domain}"
+    if not name.endswith(suffix):
+        return False
+    subdomain = name[: -len(suffix)]  # e.g. "www" or "mail.sub"
+    return all(is_valid_hostname_label(lbl) for lbl in subdomain.split("."))
+
+
 def walk_zone(
     domain: str,
     ns_ip: str,
@@ -201,12 +232,17 @@ def walk_zone(
     """
     Follow the NSEC chain starting at the zone apex.
 
+    Skips synthetic / trap names (e.g. \\000.\\000...) that some
+    nameservers return to stall automated walkers.
+
     Returns a list of {"name": str, "types": [str]} dicts for every
-    owner name discovered (excluding the apex itself).
+    real owner name discovered (excluding the apex itself).
     """
     discovered: list[dict] = []
     seen: set[str] = set()
     current = domain
+    trap_streak = 0  # consecutive invalid names
+    MAX_TRAP_STREAK = 3  # abort after this many in a row
 
     print(f"\n  {'Owner':<48} Next →")
     print(f"  {'-' * 48} ------")
@@ -223,9 +259,25 @@ def walk_zone(
             print(f"  {current:<48} (no NSEC record — stopping)")
             break
 
+        # ── Trap / synthetic name detection ──────────────────
+        if not is_valid_zone_name(next_name, domain):
+            trap_streak += 1
+            print(f"  {current:<48} ⚠ synthetic next='{next_name}' (skipping)")
+            if trap_streak >= MAX_TRAP_STREAK:
+                print(
+                    f"\n  Detected trap pattern ({trap_streak} consecutive synthetic names) — aborting walk."
+                )
+                break
+            # Jump past the trap: query the synthetic name directly
+            # to get its NSEC and hopefully land back on a real name.
+            current = next_name
+            continue
+
+        trap_streak = 0  # reset on a valid name
+
         print(f"  {current:<48} {next_name}")
 
-        if current != domain:
+        if current != domain and is_valid_zone_name(current, domain):
             discovered.append({"name": current, "types": types})
 
         # Full loop back to apex

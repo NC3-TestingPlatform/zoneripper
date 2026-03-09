@@ -81,20 +81,25 @@ def resolve_to_ip(hostname: str, resolver: dns.resolver.Resolver) -> Optional[st
     return None
 
 
-def get_zone_nameserver_ip(
-    domain: str, resolver: dns.resolver.Resolver
-) -> Optional[str]:
-    """Return an IP for the first authoritative NS of *domain*."""
+def get_zone_nameserver_ips(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
+    """
+    Return IPs for ALL authoritative NS records of *domain*.
+
+    Large TLDs (e.g. .se, .com) run anycast clusters where individual nodes
+    may rate-limit or drop NSEC queries differently. Returning all IPs lets
+    the caller retry across the full set rather than trusting a single node.
+    """
+    ips: list[str] = []
     try:
         ns_ans = resolver.resolve(domain, "NS", raise_on_no_answer=False)
         if ns_ans.rrset:
             for rdata in ns_ans.rrset:
                 ip = resolve_to_ip(str(rdata.target), resolver)
-                if ip:
-                    return ip
+                if ip and ip not in ips:
+                    ips.append(ip)
     except dns.exception.DNSException:
         pass
-    return None
+    return ips
 
 
 # ─────────────────────────────────────────────────────────────
@@ -168,28 +173,36 @@ def parse_nsec_types(rdata) -> list[str]:
 
 def get_nsec_record(
     owner: str,
-    ns_ip: str,
+    ns_ips: list[str],
     timeout: float = 5.0,
 ) -> tuple[Optional[str], list[str]]:
     """
-    Query for the NSEC record at *owner* via a direct UDP query.
+    Query for the NSEC record at *owner*, trying each NS IP in turn.
+
+    Some anycast nodes silently drop NSEC queries; rotating through all
+    known NS IPs makes the walk resilient to per-node rate-limiting.
 
     Returns:
         (next_owner_name, [rr_type_strings])
-        or (None, []) if no NSEC found.
+        or (None, []) if no NSEC found on any nameserver.
     """
-    response = udp_query(owner, dns.rdatatype.NSEC, ns_ip, timeout)
-    if response is None:
-        return None, []
+    for ns_ip in ns_ips:
+        response = udp_query(owner, dns.rdatatype.NSEC, ns_ip, timeout)
+        if response is None:
+            log.debug("No response from %s for NSEC %s — trying next NS", ns_ip, owner)
+            continue
 
-    # Check answer section first, then authority
-    for section in (response.answer, response.authority):
-        for rrset in section:
-            if rrset.rdtype == dns.rdatatype.NSEC:
-                rdata = list(rrset)[0]
-                next_name = str(rdata.next).rstrip(".")
-                types = parse_nsec_types(rdata)
-                return next_name, types
+        # Check answer section first, then authority
+        for section in (response.answer, response.authority):
+            for rrset in section:
+                if rrset.rdtype == dns.rdatatype.NSEC:
+                    rdata = list(rrset)[0]
+                    next_name = str(rdata.next).rstrip(".")
+                    types = parse_nsec_types(rdata)
+                    log.debug("NSEC record obtained from %s for %s", ns_ip, owner)
+                    return next_name, types
+
+        log.debug("NS %s returned no NSEC for %s — trying next NS", ns_ip, owner)
 
     return None, []
 
@@ -232,7 +245,7 @@ def is_valid_zone_name(name: str, domain: str) -> bool:
 
 def walk_zone(
     domain: str,
-    ns_ip: str,
+    ns_ips: list[str],
     max_steps: int = 50,
 ) -> list[dict]:
     """
@@ -259,7 +272,7 @@ def walk_zone(
             break
         seen.add(current)
 
-        next_name, types = get_nsec_record(current, ns_ip)
+        next_name, types = get_nsec_record(current, ns_ips)
 
         if not next_name:
             log.info("%-48s  (no NSEC record — stopping)", current)
@@ -349,17 +362,18 @@ def run(
     log.info("DNSKEY records present — DNSSEC is ENABLED.")
 
     # ── 2. Resolve authoritative NS ─────────────────────────
-    log.info("[2] Resolving authoritative nameserver...")
-    ns_ip = get_zone_nameserver_ip(domain, resolver)
-    if not ns_ip:
-        ns_ip = nameserver or resolver.nameservers[0]
-        log.warning("Could not resolve NS; falling back to %s", ns_ip)
+    log.info("[2] Resolving authoritative nameservers...")
+    ns_ips = get_zone_nameserver_ips(domain, resolver)
+    if not ns_ips:
+        fallback = nameserver or resolver.nameservers[0]
+        log.warning("Could not resolve any NS; falling back to %s", fallback)
+        ns_ips = [fallback]
     else:
-        log.info("Authoritative NS IP: %s", ns_ip)
+        log.info("Authoritative NS IPs: %s", ", ".join(ns_ips))
 
     # ── 3. NSEC vs NSEC3 ────────────────────────────────────
     log.info("[3] Detecting denial-of-existence mechanism...")
-    nsec_type = detect_nsec_type(domain, ns_ip)
+    nsec_type = detect_nsec_type(domain, ns_ips[0])
 
     if nsec_type == "NSEC3":
         log.info("NSEC3 detected — NOT vulnerable to zone walking.")
@@ -373,7 +387,7 @@ def run(
 
     # ── 4. Walk ─────────────────────────────────────────────
     log.info("[4] Attempting NSEC zone walk...")
-    discovered = walk_zone(domain, ns_ip, max_steps=max_steps)
+    discovered = walk_zone(domain, ns_ips, max_steps=max_steps)
 
     # ── 5. Report ────────────────────────────────────────────
     log.info("[5] Results")

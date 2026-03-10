@@ -2,6 +2,11 @@
 """
 ZoneRipper - DNSSEC Zone Walking Tester
 
+Probes a domain for DNSSEC zone-walking exposure:
+  - NSEC zones  : follows the NSEC chain to enumerate all owner names.
+  - NSEC3 zones : actively walks the hash ring to collect all NSEC3 hashes,
+                  then optionally cracks them via dictionary attack.
+
 Install:
     pip install dnspython
 
@@ -27,7 +32,6 @@ import logging
 import os
 import string
 import sys
-import uuid
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -47,6 +51,22 @@ except ImportError:
 
 log = logging.getLogger(__name__)
 
+# ─────────────────────────────────────────────────────────────
+# Constants
+# ─────────────────────────────────────────────────────────────
+
+# SHA-1 produces 20-byte digests; these bound the flat hash space used by HashRing.
+_HASH_MIN = b"\x00" * 20
+_HASH_MAX = b"\xff" * 20
+
+# DNS NSEC3 uses base32hex (RFC 4648 §7) with alphabet 0–9 A–V,
+# NOT standard base32 (A–Z 2–7). Python's base64 module only speaks
+# standard base32, so we translate alphabets before encoding/decoding.
+_B32HEX = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
+_B32STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
+_TO_STD = str.maketrans(_B32HEX, _B32STD)  # base32hex → standard
+_TO_B32HEX = str.maketrans(_B32STD, _B32HEX)  # standard  → base32hex
+
 
 # ─────────────────────────────────────────────────────────────
 # Data structures
@@ -59,19 +79,19 @@ class Nsec3Params:
 
     algorithm: int  # 1 = SHA-1 (only algorithm defined in RFC 5155)
     flags: int  # 1 = opt-out
-    iterations: int  # extra hash rounds (0-2500)
+    iterations: int  # extra hash rounds (0–2500)
     salt: bytes  # raw salt bytes (may be empty)
-    salt_hex: str  # hex-encoded salt or "-" for empty
+    salt_hex: str  # hex-encoded salt, or "-" for empty
 
 
 @dataclass
 class Nsec3Hash:
-    """A single (owner_hash, next_hash) pair from an NSEC3 record."""
+    """A single (owner_hash → next_hash) link from one NSEC3 record."""
 
-    owner_b32: str  # base32-encoded owner hash (from DNS name label)
-    next_b32: str  # base32-encoded next hash
-    types: list[str]  # RR types present at this name
-    source_ns: str  # which NS returned this record
+    owner_b32: str  # base32hex owner hash (first label of the DNS name)
+    next_b32: str  # base32hex next hash  (rdata .next field)
+    types: list[str]  # RR types present at this owner name
+    source_ns: str  # NS IP that returned this record
 
 
 @dataclass
@@ -80,99 +100,124 @@ class Nsec3WalkResult:
 
     params: Optional[Nsec3Params]
     hashes: list[Nsec3Hash] = field(default_factory=list)
-    cracked: dict[str, str] = field(default_factory=dict)  # hash_b32 -> plaintext
+    cracked: dict[str, str] = field(default_factory=dict)  # owner_b32 → plaintext label
 
 
 @dataclass
 class HashInterval:
-    start: bytes  # owner hash (raw 20-byte SHA-1 digest)
-    end: bytes  # next hash
+    """A covered half-open interval [start, end) in the flat 20-byte hash space."""
+
+    start: bytes
+    end: bytes
 
 
 class HashRing:
-    """Sorted, non-overlapping set of covered NSEC3 intervals."""
+    """
+    Tracks which portions of the NSEC3 hash space have been covered.
 
-    def __init__(self):
-        # List of HashInterval, kept sorted by .start
+    Internally stores a sorted, non-overlapping list of HashInterval objects
+    that together represent all hash ranges seen so far.  Because individual
+    NSEC3 records can "wrap around" (owner hash > next hash, i.e. the last
+    record in the zone points back to the first hash), wrap-around intervals
+    are split into two linear segments on insertion so that all arithmetic
+    stays simple and monotone.
+
+    The hash space is treated as the flat range [0x00*20, 0xff*20], not as a
+    true ring. Completion is detected when that entire flat range is covered.
+    """
+
+    def __init__(self) -> None:
         self._intervals: list[HashInterval] = []
 
-    def insert(self, start_b32: str, end_b32: str) -> bool:
+    # ── public interface ──────────────────────────────────────
+
+    def insert(self, start_b32: str, end_b32: str) -> None:
         """
-        Add an (owner, next) pair.  Converts from base32hex to raw bytes,
-        inserts in sorted order, then merges any newly adjacent intervals.
-        Returns True if the ring actually grew (new coverage was added).
+        Record coverage of the interval (start_b32, end_b32).
+
+        Wrap-around intervals (start > end in byte order) are split:
+            [start → 0xff*20]  +  [0x00*20 → end]
+        so that _merge only ever needs to handle linear intervals.
         """
         start = _b32hex_to_bytes(start_b32)
         end = _b32hex_to_bytes(end_b32)
 
         if start < end:
-            # Normal interval — insert as-is
-            intervals_to_add = [HashInterval(start, end)]
+            to_add = [HashInterval(start, end)]
         else:
-            # Wrap-around interval (last record in zone points back to first hash)
-            # Split into two linear segments:
-            #   [start → 0xff...ff]  and  [0x00...00 → end]
-            MAX = b"\xff" * 20
-            MIN = b"\x00" * 20
-            intervals_to_add = [
-                HashInterval(start, MAX),
-                HashInterval(MIN, end),
+            # Wrap-around: last NSEC3 record points from a high hash back to
+            # the lowest hash in the zone.  Split at the boundary.
+            to_add = [
+                HashInterval(start, _HASH_MAX),
+                HashInterval(_HASH_MIN, end),
             ]
 
-        for iv in intervals_to_add:
-            keys = [i.start for i in self._intervals]
-            idx = bisect.bisect_left(keys, iv.start)
+        for iv in to_add:
+            idx = bisect.bisect_left([i.start for i in self._intervals], iv.start)
             self._intervals.insert(idx, iv)
 
         self._merge()
-        return True
-
-    def _merge(self):
-        """Collapse abutting or overlapping intervals in-place (linear only)."""
-        merged = []
-        for iv in self._intervals:
-            if merged and iv.start <= merged[-1].end:
-                if iv.end > merged[-1].end:
-                    merged[-1] = HashInterval(merged[-1].start, iv.end)
-            else:
-                merged.append(HashInterval(iv.start, iv.end))
-        self._intervals = merged
 
     def gaps(self) -> list[tuple[bytes, bytes]]:
         """
-        Return a list of uncovered (gap_start, gap_end) byte pairs,
-        including the wrap-around gap.
-
-        The hash space is treated as a circle: after the last interval's
-        end, the next expected start is the first interval's start.
+        Return all uncovered sub-ranges of [_HASH_MIN, _HASH_MAX] as a list
+        of (gap_start, gap_end) byte pairs.  An empty list means the ring is
+        fully covered.
         """
-        MIN = b"\x00" * 20
-        MAX = b"\xff" * 20
-
         if not self._intervals:
-            return [(MIN, MAX)]
+            return [(_HASH_MIN, _HASH_MAX)]
 
-        result = []
+        result: list[tuple[bytes, bytes]] = []
         ivs = self._intervals
 
-        # Gap before the first interval
-        if ivs[0].start > MIN:
-            result.append((MIN, ivs[0].start))
+        # Gap before the first known interval
+        if ivs[0].start > _HASH_MIN:
+            result.append((_HASH_MIN, ivs[0].start))
 
         # Gaps between consecutive intervals
         for i in range(len(ivs) - 1):
             if ivs[i].end < ivs[i + 1].start:
                 result.append((ivs[i].end, ivs[i + 1].start))
 
-        # Gap after the last interval
-        if ivs[-1].end < MAX:
-            result.append((ivs[-1].end, MAX))
+        # Gap after the last known interval
+        if ivs[-1].end < _HASH_MAX:
+            result.append((ivs[-1].end, _HASH_MAX))
 
         return result
 
-        def is_complete(self) -> bool:
-            """True when there are no gaps in the ring."""
-            return len(self.gaps()) == 0
+    def is_complete(self) -> bool:
+        """Return True when there are no uncovered gaps."""
+        return len(self.gaps()) == 0
+
+    # ── private helpers ───────────────────────────────────────
+
+    def _merge(self) -> None:
+        """Collapse abutting or overlapping intervals in-place."""
+        merged: list[HashInterval] = []
+        for iv in self._intervals:
+            if merged and iv.start <= merged[-1].end:
+                # Extend the last merged interval if this one reaches further
+                if iv.end > merged[-1].end:
+                    merged[-1] = HashInterval(merged[-1].start, iv.end)
+            else:
+                merged.append(HashInterval(iv.start, iv.end))
+        self._intervals = merged
+
+
+# ─────────────────────────────────────────────────────────────
+# base32hex helpers  (used throughout for NSEC3 label encoding)
+# ─────────────────────────────────────────────────────────────
+
+
+def _bytes_to_b32hex(raw: bytes) -> str:
+    """Encode raw bytes as uppercase base32hex (RFC 4648 §7), no padding."""
+    return base64.b32encode(raw).decode().rstrip("=").upper().translate(_TO_B32HEX)
+
+
+def _b32hex_to_bytes(b32hex: str) -> bytes:
+    """Decode a base32hex string (as it appears in DNS NSEC3 owner labels)."""
+    padded = b32hex.upper().translate(_TO_STD) + "=" * (-len(b32hex) % 8)
+    return base64.b32decode(padded)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -181,11 +226,10 @@ class HashRing:
 
 
 def make_resolver(nameserver: Optional[str] = None) -> dns.resolver.Resolver:
-    """Build a Resolver with the DO (DNSSEC OK) bit set."""
+    """Return a Resolver with the DNSSEC OK (DO) bit set."""
     r = dns.resolver.Resolver(configure=True)
     if nameserver:
         r.nameservers = [nameserver]
-    # Request DNSSEC records in every query
     r.use_edns(ednsflags=dns.flags.DO, payload=4096)
     return r
 
@@ -196,7 +240,14 @@ def udp_query(
     nameserver_ip: str,
     timeout: float = 5.0,
 ) -> Optional[dns.message.Message]:
-    """Send a raw UDP query with DO bit; return the Message or None on error."""
+    """
+    Send a single UDP query with the DO bit set.
+
+    Returns the parsed Message on success, or None on any DNS/network error.
+    Using raw UDP (instead of the high-level Resolver) lets us inspect the
+    full authority section, which is where NSEC/NSEC3 records appear on
+    NXDOMAIN responses.
+    """
     try:
         name = dns.name.from_text(qname)
         req = dns.message.make_query(name, rdtype, use_edns=True, want_dnssec=True)
@@ -206,7 +257,7 @@ def udp_query(
 
 
 def resolve_to_ip(hostname: str, resolver: dns.resolver.Resolver) -> Optional[str]:
-    """Resolve a hostname to its first A record IP."""
+    """Resolve a hostname to its first A record, or None on failure."""
     try:
         ans = resolver.resolve(hostname, "A", raise_on_no_answer=False)
         if ans.rrset:
@@ -218,11 +269,11 @@ def resolve_to_ip(hostname: str, resolver: dns.resolver.Resolver) -> Optional[st
 
 def get_zone_nameserver_ips(domain: str, resolver: dns.resolver.Resolver) -> list[str]:
     """
-    Return IPs for ALL authoritative NS records of *domain*.
+    Return the IP addresses of all authoritative NS records for *domain*.
 
-    Large TLDs (e.g. .se, .com) run anycast clusters where individual nodes
-    may rate-limit or drop NSEC queries differently. Returning all IPs lets
-    the caller retry across the full set rather than trusting a single node.
+    Large TLDs run anycast clusters where individual nodes may rate-limit or
+    silently drop NSEC/NSEC3 queries differently.  Returning all IPs lets
+    callers rotate through the full set rather than relying on a single node.
     """
     ips: list[str] = []
     try:
@@ -243,7 +294,7 @@ def get_zone_nameserver_ips(domain: str, resolver: dns.resolver.Resolver) -> lis
 
 
 def check_dnssec_enabled(domain: str, resolver: dns.resolver.Resolver) -> bool:
-    """True when at least one DNSKEY record exists at the zone apex."""
+    """Return True when at least one DNSKEY record exists at the zone apex."""
     try:
         ans = resolver.resolve(domain, "DNSKEY", raise_on_no_answer=False)
         return bool(ans.rrset)
@@ -251,14 +302,12 @@ def check_dnssec_enabled(domain: str, resolver: dns.resolver.Resolver) -> bool:
         return False
 
 
-def detect_nsec_type(
-    domain: str,
-    ns_ip: str,
-    timeout: float = 5.0,
-) -> str:
+def detect_nsec_type(domain: str, ns_ip: str, timeout: float = 5.0) -> str:
     """
-    Query a guaranteed non-existent name inside *domain* and inspect the
-    authority section of the response for NSEC / NSEC3 records.
+    Determine whether the zone uses NSEC or NSEC3 for denial-of-existence.
+
+    Sends a query for a guaranteed-nonexistent name and inspects the authority
+    section of the NXDOMAIN response for NSEC / NSEC3 records.
 
     Returns: "NSEC" | "NSEC3" | "UNKNOWN"
     """
@@ -267,16 +316,11 @@ def detect_nsec_type(
     if response is None:
         return "UNKNOWN"
 
-    nsec3_found = any(
-        rrset.rdtype == dns.rdatatype.NSEC3 for rrset in response.authority
-    )
-    if nsec3_found:
+    rdtypes = {rrset.rdtype for rrset in response.authority}
+    if dns.rdatatype.NSEC3 in rdtypes:
         return "NSEC3"
-
-    nsec_found = any(rrset.rdtype == dns.rdatatype.NSEC for rrset in response.authority)
-    if nsec_found:
+    if dns.rdatatype.NSEC in rdtypes:
         return "NSEC"
-
     return "UNKNOWN"
 
 
@@ -287,8 +331,11 @@ def detect_nsec_type(
 
 def parse_nsec_types(rdata) -> list[str]:
     """
-    Extract the advertised RR type names from an NSEC/NSEC3 rdata object.
-    Works with dnspython's window-based bitmap representation.
+    Extract RR type names from an NSEC or NSEC3 rdata bitmap.
+
+    dnspython represents the type bitmap as a list of (window_number, bitmap)
+    pairs; this function iterates all set bits and converts each to its
+    human-readable type name.
     """
     types: list[str] = []
     try:
@@ -314,12 +361,10 @@ def get_nsec_record(
     """
     Query for the NSEC record at *owner*, trying each NS IP in turn.
 
-    Some anycast nodes silently drop NSEC queries; rotating through all
-    known NS IPs makes the walk resilient to per-node rate-limiting.
+    Rotating through all known NS IPs makes the walk resilient to per-node
+    rate-limiting on anycast nameservers.
 
-    Returns:
-        (next_owner_name, [rr_type_strings])
-        or (None, []) if no NSEC found on any nameserver.
+    Returns (next_owner_name, [rr_type_strings]), or (None, []) on failure.
     """
     for ns_ip in ns_ips:
         response = udp_query(owner, dns.rdatatype.NSEC, ns_ip, timeout)
@@ -327,14 +372,13 @@ def get_nsec_record(
             log.debug("No response from %s for NSEC %s — trying next NS", ns_ip, owner)
             continue
 
-        # Check answer section first, then authority
         for section in (response.answer, response.authority):
             for rrset in section:
                 if rrset.rdtype == dns.rdatatype.NSEC:
                     rdata = list(rrset)[0]
                     next_name = str(rdata.next).rstrip(".")
                     types = parse_nsec_types(rdata)
-                    log.debug("NSEC record obtained from %s for %s", ns_ip, owner)
+                    log.debug("NSEC record from %s for %s", ns_ip, owner)
                     return next_name, types
 
         log.debug("NS %s returned no NSEC for %s — trying next NS", ns_ip, owner)
@@ -349,17 +393,15 @@ def get_nsec_record(
 
 def is_valid_hostname_label(label: str) -> bool:
     """
-    Return True if a DNS label looks like a real hostname component.
-    Rejects labels containing null bytes, non-printable characters,
-    or other synthetic patterns injected by some nameservers to
-    trap zone walkers (e.g. \\000, \\001, ...).
+    Return True if *label* looks like a real DNS hostname component.
+
+    Rejects labels containing null bytes or non-printable characters — these
+    are synthetic values injected by some nameservers to stall zone walkers.
     """
     if not label:
         return False
-    # Null-byte / escape sequences used by trap nameservers
     if "\\000" in label or "\x00" in label:
         return False
-    # Allow only printable ASCII that is valid in a hostname label
     allowed = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789-_.*")
     return all(c in allowed for c in label)
 
@@ -367,7 +409,8 @@ def is_valid_hostname_label(label: str) -> bool:
 def is_valid_zone_name(name: str, domain: str) -> bool:
     """
     Return True if *name* is a plausible real owner name inside *domain*.
-    Strips the domain suffix and validates every remaining label.
+
+    Strips the zone suffix and validates every remaining label individually.
     """
     if name == domain:
         return True
@@ -379,87 +422,81 @@ def is_valid_zone_name(name: str, domain: str) -> bool:
 
 
 def walk_zone(
-    domain: str,
-    ns_ips: list[str],
-    max_steps: int = 50,
+    domain: str, ns_ips: list[str], max_steps: Optional[int] = 50
 ) -> list[dict]:
     """
     Follow the NSEC chain starting at the zone apex.
 
-    Skips synthetic / trap names (e.g. \\000.\\000...) that some
-    nameservers return to stall automated walkers.
+    Each step queries the current owner for its NSEC record and advances to
+    the next owner name.  Synthetic "trap" names injected by hardened
+    nameservers are detected and skipped.
 
-    Returns a list of {"name": str, "types": [str]} dicts for every
-    real owner name discovered (excluding the apex itself).
+    Returns a list of {"name": str, "types": [str]} dicts for every real
+    owner name discovered (excluding the zone apex itself).
     """
     discovered: list[dict] = []
     seen: set[str] = set()
     current = domain
-    trap_streak = 0  # consecutive invalid names
-    MAX_TRAP_STREAK = 3  # abort after this many in a row
+    trap_streak = 0
+    MAX_TRAP_STREAK = 3
 
-    log.debug("%-48s  %s", "Owner", "Next ->")
-    log.debug("%s  %s", "-" * 48, "------")
+    log.debug("%-48s  %s", "Owner", "Next")
+    log.debug("%s  %s", "-" * 48, "----")
 
-    for step in range(max_steps):
+    step_iter = itertools.count() if max_steps is None else range(max_steps)
+    for step in step_iter:
         if current in seen:
-            log.info("Loop detected at '%s' - walk complete.", current)
+            log.info("Loop detected at '%s' — walk complete.", current)
             break
         seen.add(current)
 
         next_name, types = get_nsec_record(current, ns_ips)
-
         if not next_name:
-            log.info("%-48s  (no NSEC record - stopping)", current)
+            log.info("%-48s  (no NSEC record — stopping)", current)
             break
 
-        # ── Trap / synthetic name detection ──────────────────
+        # Detect synthetic / trap names
         if not is_valid_zone_name(next_name, domain):
             trap_streak += 1
             log.warning("%-48s  synthetic next='%s' (skipping)", current, next_name)
             if trap_streak >= MAX_TRAP_STREAK:
                 log.warning(
-                    "Detected trap pattern (%d consecutive synthetic names) - aborting walk.",
+                    "Trap pattern detected (%d consecutive synthetic names) — aborting.",
                     trap_streak,
                 )
                 break
-            # Jump past the trap: query the synthetic name directly
-            # to get its NSEC and hopefully land back on a real name.
-            current = next_name
+            current = next_name  # jump through the trap to find real names beyond it
             continue
 
-        trap_streak = 0  # reset on a valid name
-
+        trap_streak = 0
         log.info("%-48s  %s", current, next_name)
 
         if current != domain and is_valid_zone_name(current, domain):
             discovered.append({"name": current, "types": types})
 
-        # Full loop back to apex
         if next_name == domain:
-            log.info("Returned to zone apex - full loop completed.")
+            log.info("Returned to zone apex — full loop completed.")
             break
 
-        # Left the zone
         if not (next_name.endswith(f".{domain}") or next_name == domain):
-            log.info("Next name '%s' is outside zone - stopping.", next_name)
+            log.info("Next name '%s' is outside zone — stopping.", next_name)
             break
 
         current = next_name
-
     else:
-        log.warning("Reached max-steps limit (%d).", max_steps)
+        if max_steps is not None:
+            log.warning("Reached max-steps limit (%d).", max_steps)
 
     return discovered
 
 
 # ─────────────────────────────────────────────────────────────
-# NSEC3 - hash collection
+# NSEC3 hash collection — parsing helpers
 # ─────────────────────────────────────────────────────────────
 
 
 def _extract_nsec3_params(rdata) -> Optional[Nsec3Params]:
-    """Extract NSEC3 algorithm parameters from an rdata object."""
+    """Extract NSEC3 zone parameters from a single rdata object."""
     try:
         salt_bytes = rdata.salt if rdata.salt else b""
         return Nsec3Params(
@@ -475,22 +512,18 @@ def _extract_nsec3_params(rdata) -> Optional[Nsec3Params]:
 
 def _parse_nsec3_rdata(rdata, owner_label: str, ns_ip: str) -> Optional[Nsec3Hash]:
     """
-    Extract an Nsec3Hash from a single NSEC3 rdata object.
+    Build an Nsec3Hash from a single NSEC3 rdata object.
 
-    dnspython exposes NSEC3 rdata with attributes:
+    dnspython exposes NSEC3 rdata with:
         .algorithm  .flags  .iterations  .salt  .next  .windows
-    The owner label is the first label of the owner name (the hash itself),
-    already in base32 uppercase as it appears in the DNS wire format.
-    The .next field is the raw bytes of the next owner hash.
+    The owner label (first DNS name label) is already the base32hex hash.
+    The .next field holds the raw bytes of the next hash in the chain.
     """
     try:
-        owner_b32 = owner_label.upper()
-        next_b32 = _bytes_to_b32hex(rdata.next)
-        types = parse_nsec_types(rdata)
         return Nsec3Hash(
-            owner_b32=owner_b32,
-            next_b32=next_b32,
-            types=types,
+            owner_b32=owner_label.upper(),
+            next_b32=_bytes_to_b32hex(rdata.next),
+            types=parse_nsec_types(rdata),
             source_ns=ns_ip,
         )
     except Exception as exc:
@@ -498,25 +531,27 @@ def _parse_nsec3_rdata(rdata, owner_label: str, ns_ip: str) -> Optional[Nsec3Has
         return None
 
 
+# ─────────────────────────────────────────────────────────────
+# NSEC3 hash collection — active walk
+# ─────────────────────────────────────────────────────────────
+
+
 def _hash_falls_in_gap(h: bytes, gap_start: bytes, gap_end: bytes) -> bool:
     """
-    Return True if h falls inside the half-open interval (gap_start, gap_end).
-    For wrap-around gaps where gap_end < gap_start, the interval crosses
-    the 0xff...→0x00... boundary, so membership is inverted.
+    Return True if *h* lies strictly inside the open interval (gap_start, gap_end).
+
+    Because HashRing now stores only linear (non-wrapping) intervals and all
+    gaps are expressed in the flat [MIN, MAX] space, gap_end is always greater
+    than gap_start and the simple comparison is sufficient.
     """
-    if gap_start < gap_end:
-        # Normal interval: h must be strictly between start and end
-        return gap_start < h < gap_end
-    else:
-        # Wrap-around: h is in gap if it's ABOVE start OR BELOW end
-        return h > gap_start or h < gap_end
+    return gap_start < h < gap_end
 
 
 def _label_generator():
     """
-    Yield candidate DNS labels:
-    short strings first, in lexicographic order by length.
-    Covers: 0-9, a-z, then combinations thereof.
+    Yield candidate DNS labels in ascending length order, then lexicographically.
+
+    Produces: 0–9, a–z, 00–0z, 01–0z, ..., aa–zz, 000–zzz, ...
     """
     charset = string.digits + string.ascii_lowercase
     length = 1
@@ -535,11 +570,13 @@ def find_candidate_for_any_gap(
     max_tries: int = 500_000,
 ) -> tuple[str, bytes, tuple[bytes, bytes]] | None:
     """
-    Advance the shared iterator, hash each label, and return the first label
-    whose hash falls in ANY of the provided gaps.
+    Consume labels from the shared iterator until one hashes into any gap.
+
+    Checking every label against all gaps at once ensures no label is ever
+    wasted — if a hash misses the largest gap but falls into a smaller one,
+    it is still used immediately.
 
     Returns (label, raw_hash, matching_gap) or None if max_tries exhausted.
-    No labels are wasted — every hash is checked against all gaps.
     """
     for _ in range(max_tries):
         try:
@@ -559,36 +596,53 @@ def find_candidate_for_any_gap(
 def collect_nsec3_hashes(
     domain: str,
     ns_ips: list[str],
-    rounds: int = 100,  # a soft cap, not a hard iteration count
+    rounds: Optional[int] = 100,
     timeout: float = 5.0,
 ) -> Nsec3WalkResult:
     """
-    Active NSEC3 zone walk.
+    Actively enumerate all NSEC3 hashes in *domain* using a gap-targeted walk.
 
     Algorithm
     ---------
-    1. Seed with a few random probes to bootstrap the ring.
-    2. Inspect the ring for uncovered gaps.
-    3. Generate a query label whose hash falls inside the largest gap.
-    4. Send the query; insert all returned NSEC3 intervals.
-    5. Repeat until no gaps remain or the round limit is hit.
+    Phase 1 — Bootstrap:
+        Query a fixed name ("0.<domain>") to obtain the zone's NSEC3 parameters
+        and seed the hash ring with the first known intervals.  Using a fixed
+        name (rather than random UUIDs) makes the starting state deterministic.
+
+    Phase 2 — Active gap targeting:
+        Repeat until the hash ring is fully covered or *rounds* is exhausted:
+        1. Compute the current uncovered gaps in the hash ring.
+        2. Generate candidate labels (via _label_generator) until one hashes
+           into any gap — checking all gaps per label to waste nothing.
+        3. Query that candidate; parse every NSEC3 record from the response
+           (both answer and authority sections) into the ring.
+
+    Each DNS query typically returns 2–3 NSEC3 records (closest encloser,
+    next closer, wildcard proofs), so the ring fills faster than one record
+    per query.
     """
     result = Nsec3WalkResult(params=None)
     ring = HashRing()
 
-    def _process_response(response, ns_ip: str) -> int:
-        """Parse NSEC3 records from a response, update ring + result. Returns new interval count."""
+    # ── inner helper: parse a response and update shared state ────────────
+
+    def _process_response(response: dns.message.Message, ns_ip: str) -> int:
+        """
+        Extract all NSEC3 records from *response* (answer + authority sections),
+        add any new ones to *result* and *ring*, and return the count added.
+        """
         added = 0
         for section in (response.answer, response.authority):
             for rrset in section:
                 if rrset.rdtype != dns.rdatatype.NSEC3:
                     continue
                 for rdata in rrset:
+                    # Capture zone parameters from the first NSEC3 record seen
                     if result.params is None:
                         result.params = _extract_nsec3_params(rdata)
                         if result.params:
                             log.info(
-                                "NSEC3 params – algorithm: %d  iterations: %d  salt: %s",
+                                "NSEC3 params — algorithm: %d  iterations: %d  salt: %s",
                                 result.params.algorithm,
                                 result.params.iterations,
                                 result.params.salt_hex,
@@ -602,8 +656,9 @@ def collect_nsec3_hashes(
                         added += 1
         return added
 
-    # ── Phase 1: bootstrap with random probes ─────────────────
-    log.info("Phase 1: bootstrapping with apex query...")
+    # ── Phase 1: deterministic bootstrap ──────────────────────────────────
+
+    log.info("Phase 1: bootstrapping with apex probe (0.%s)...", domain)
     for ns_ip in ns_ips:
         resp = udp_query(f"0.{domain}", dns.rdatatype.A, ns_ip, timeout)
         if resp:
@@ -611,27 +666,33 @@ def collect_nsec3_hashes(
             break
 
     if result.params is None:
-        log.warning(
-            "No NSEC3 records received during bootstrap – zone may not use NSEC3."
-        )
+        log.warning("No NSEC3 records in bootstrap response — zone may not use NSEC3.")
         return result
 
-    # ── Phase 2: active gap targeting ─────────────────────────
-    log.info("Phase 2: active gap-targeted walk (max %d rounds)...", rounds)
+    # ── Phase 2: active gap-targeted walk ─────────────────────────────────
 
+    log.info(
+        "Phase 2: active gap-targeted walk (%s)...",
+        f"max {rounds} rounds" if rounds is not None else "unlimited rounds",
+    )
     label_iter = _label_generator()
-    for step in range(rounds):
+
+    round_iter = itertools.count() if rounds is None else range(rounds)
+    for step in round_iter:
         gaps = ring.gaps()
         if not gaps:
             log.info(
-                "Hash ring fully covered after %d steps. Total hashes: %d",
+                "Hash ring fully covered after %d step(s). Total hashes: %d",
                 step,
                 len(result.hashes),
             )
             break
 
         log.debug(
-            "Step %d: %d gap(s), %d hashes so far", step, len(gaps), len(result.hashes)
+            "Step %d: %d gap(s), %d hash(es) so far",
+            step,
+            len(gaps),
+            len(result.hashes),
         )
 
         hit = find_candidate_for_any_gap(
@@ -641,14 +702,15 @@ def collect_nsec3_hashes(
             gaps,
             label_iter,
         )
-
         if hit is None:
-            log.warning("Label space exhausted – could not fill remaining gaps.")
+            log.warning(
+                "Label space exhausted — could not fill remaining %d gap(s).", len(gaps)
+            )
             break
 
         label, _, matched_gap = hit
         log.debug(
-            "  label=%s matched gap %s…%s",
+            "  label=%-12s  matched gap %s…%s",
             label,
             matched_gap[0].hex()[:8],
             matched_gap[1].hex()[:8],
@@ -660,54 +722,32 @@ def collect_nsec3_hashes(
             if resp:
                 new = _process_response(resp, ns_ip)
                 if new:
-                    log.debug("  → +%d interval(s), total %d", new, len(result.hashes))
+                    log.debug("    +%d interval(s) → total %d", new, len(result.hashes))
                 break
+    else:
+        if rounds is not None:
+            log.warning(
+                "Round limit (%d) reached with %d gap(s) remaining.",
+                rounds,
+                len(ring.gaps()),
+            )
 
-    log.info("Collected %d unique NSEC3 hashes.", len(result.hashes))
+    log.info("Collected %d unique NSEC3 hash(es).", len(result.hashes))
     return result
 
 
 # ─────────────────────────────────────────────────────────────
-# NSEC3 - hash cracking (pure Python SHA-1, RFC 5155 §5)
+# NSEC3 hash cracking  (pure-Python SHA-1, RFC 5155 §5)
 # ─────────────────────────────────────────────────────────────
-
-# DNS NSEC3 uses base32hex (RFC 4648 §7) with alphabet 0-9 A-V,
-# NOT standard base32 (A-Z 2-7). Python's base64 module only speaks
-# standard base32, so we must translate alphabets before encoding/decoding.
-_B32HEX = "0123456789ABCDEFGHIJKLMNOPQRSTUV"
-_B32STD = "ABCDEFGHIJKLMNOPQRSTUVWXYZ234567"
-_TO_STD = str.maketrans(_B32HEX, _B32STD)  # base32hex -> standard
-_TO_B32HEX = str.maketrans(_B32STD, _B32HEX)  # standard  -> base32hex
-
-
-def _bytes_to_b32hex(raw: bytes) -> str:
-    """Encode raw bytes as base32hex (RFC 4648 §7), uppercase, no padding."""
-    return base64.b32encode(raw).decode().rstrip("=").upper().translate(_TO_B32HEX)
-
-
-def _b32hex_to_bytes(b32hex: str) -> bytes:
-    """Decode a base32hex string (as found in DNS NSEC3 owner labels) to raw bytes."""
-    padded = b32hex.upper().translate(_TO_STD) + "=" * (-len(b32hex) % 8)
-    return base64.b32decode(padded)
-
-
-def _b32hex_to_hex(b32hex: str) -> str:
-    """Convert a base32hex hash label to lowercase hex."""
-    return _b32hex_to_bytes(b32hex).hex()
-
-
-def _hash_to_b32hex(raw: bytes) -> str:
-    """Encode a raw SHA-1 digest as base32hex for comparison against DNS labels."""
-    return _bytes_to_b32hex(raw)
 
 
 def _is_valid_dns_label(label: str) -> bool:
     """
-    Return True if *label* is a valid DNS label that can be hashed.
+    Return True if *label* is a valid single DNS label (≤63 UTF-8 bytes).
 
-    RFC 1035 limits each label to 63 octets max. Wordlists like rockyou
-    contain entries that exceed this or contain non-encodable characters,
-    which would cause a ValueError when building the wire-format name.
+    Large wordlists (e.g. rockyou) contain entries that exceed this limit or
+    contain non-encodable characters; silently skipping them keeps cracking
+    safe to run against arbitrary input files.
     """
     try:
         encoded = label.lower().encode()
@@ -718,14 +758,12 @@ def _is_valid_dns_label(label: str) -> bool:
 
 def _nsec3_hash(label: str, domain: str, salt: bytes, iterations: int) -> bytes:
     """
-    Compute the NSEC3 hash for a candidate label as defined in RFC 5155 §5.
+    Compute the NSEC3 hash for *label*.*domain* as specified in RFC 5155 §5:
 
-    IH(salt, x, 0) = H(x || salt)
-    IH(salt, x, k) = H(IH(salt, x, k-1) || salt)   for k > 0
+        IH(salt, x, 0) = H(x || salt)
+        IH(salt, x, k) = H(IH(salt, x, k-1) || salt)   for k > 0
 
-    where H = SHA-1 and x is the wire-format fully-qualified owner name
-    with all labels lowercased.
-
+    where H = SHA-1 and x is the wire-format FQDN with all labels lowercased.
     Raises ValueError for labels that exceed 63 octets (invalid DNS label).
     """
     fqdn = f"{label.lower()}.{domain.lower()}."
@@ -749,38 +787,35 @@ def crack_nsec3_hashes(
     wordlist: list[str],
 ) -> dict[str, str]:
     """
-    Attempt to reverse NSEC3 hashes via dictionary attack (pure Python).
+    Attempt to reverse collected NSEC3 hashes via dictionary attack.
 
-    For each candidate word in *wordlist*, computes NSEC3(word + "." + domain)
-    using the zone's own salt and iteration count, then checks against all
-    collected hashes. Matches reveal real subdomain names.
+    For each candidate in *wordlist*, computes NSEC3(candidate + "." + domain)
+    using the zone's own parameters and checks it against all collected hashes.
+    A match reveals the plaintext subdomain label for that hash.
 
-    Invalid candidates (label > 63 bytes, non-encodable chars) are silently
-    skipped — this makes large wordlists like rockyou safe to use directly.
-
-    Returns a dict mapping owner_b32 -> cracked plaintext label.
+    Returns a dict mapping owner_b32 → cracked plaintext label.
+    Invalid candidates (too long, non-encodable) are silently skipped.
     """
     if result.params is None:
-        log.warning("No NSEC3 params available - cannot crack.")
+        log.warning("No NSEC3 params available — cannot crack.")
         return {}
-
     if result.params.algorithm != 1:
         log.warning(
-            "NSEC3 algorithm %d is not SHA-1 - pure-Python cracking not supported.",
+            "NSEC3 algorithm %d is not SHA-1 — pure-Python cracking not supported.",
             result.params.algorithm,
         )
         return {}
 
     salt = result.params.salt
     iterations = result.params.iterations
+    targets = {h.owner_b32: h for h in result.hashes}
 
-    target_hashes: dict[str, Nsec3Hash] = {h.owner_b32: h for h in result.hashes}
-    if not target_hashes:
+    if not targets:
         return {}
 
     log.info(
-        "Cracking %d NSEC3 hashes (salt=%s, iterations=%d) against %d candidates...",
-        len(target_hashes),
+        "Cracking %d hash(es) (salt=%s, iter=%d) against %d candidate(s)...",
+        len(targets),
         result.params.salt_hex,
         iterations,
         len(wordlist),
@@ -788,6 +823,7 @@ def crack_nsec3_hashes(
 
     cracked: dict[str, str] = {}
     skipped = 0
+
     for candidate in wordlist:
         if not _is_valid_dns_label(candidate):
             skipped += 1
@@ -797,14 +833,14 @@ def crack_nsec3_hashes(
         except (ValueError, UnicodeEncodeError):
             skipped += 1
             continue
-        b32 = _hash_to_b32hex(raw)
-        if b32 in target_hashes and b32 not in cracked:
+        b32 = _bytes_to_b32hex(raw)
+        if b32 in targets and b32 not in cracked:
             cracked[b32] = candidate
-            log.info("  CRACKED: %s  ->  %s.%s", b32, candidate, domain)
+            log.info("  CRACKED: %s  →  %s.%s", b32, candidate, domain)
 
     if skipped:
-        log.debug("Skipped %d invalid/oversized candidates.", skipped)
-    log.info("Cracked %d / %d hashes.", len(cracked), len(target_hashes))
+        log.debug("Skipped %d invalid/oversized candidate(s).", skipped)
+    log.info("Cracked %d / %d hash(es).", len(cracked), len(targets))
     result.cracked = cracked
     return cracked
 
@@ -820,16 +856,14 @@ def export_hashcat_file(
 
         <hash_b32hex_lower>:<.zone>:<salt_hex>:<iterations>
 
-    Example for domain "sh", salt "73", 0 iterations:
+    Example (domain "sh", salt "73", 0 iterations):
         9clkef9t1cpn5jp5ltaohtp49dqi9foj:.sh:73:0
 
-    Parameters
-    ----------
-    uncracked_only : When True, only export hashes that were not cracked.
-                     Used to continue cracking offline with a bigger wordlist.
+    When *uncracked_only* is True, already-cracked hashes are omitted so the
+    file can be used to continue cracking with a larger offline wordlist.
 
     Crack offline with:
-        hashcat -m 8300 <file> <wordlist> --keep-guessing
+        hashcat -m 8300 --keep-guessing <file> <wordlist>
     """
     if not result.hashes or result.params is None:
         log.warning("Nothing to export.")
@@ -838,18 +872,19 @@ def export_hashcat_file(
     salt_hex = result.params.salt_hex if result.params.salt_hex != "-" else ""
     zone = f".{domain}"
     count = 0
-    with open(path, "w") as f:
+
+    with open(path, "w") as fh:
         for h in result.hashes:
             if uncracked_only and h.owner_b32 in result.cracked:
                 continue
-            f.write(
+            fh.write(
                 f"{h.owner_b32.lower()}:{zone}:{salt_hex}:{result.params.iterations}\n"
             )
             count += 1
 
-    label = "uncracked " if uncracked_only else ""
-    log.info("Exported %d %shashes to '%s' (hashcat -m 8300)", count, label, path)
-    log.info("Run: hashcat -m 8300 --keep-guessing %s <wordlist>", path)
+    qualifier = "uncracked " if uncracked_only else ""
+    log.info("Exported %d %shash(es) to '%s' (hashcat -m 8300)", count, qualifier, path)
+    log.info("Crack offline with: hashcat -m 8300 --keep-guessing %s <wordlist>", path)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -859,56 +894,54 @@ def export_hashcat_file(
 
 def run(
     domain: str,
-    max_steps: int = 50,
+    max_steps: Optional[int] = 50,
     nameserver: Optional[str] = None,
-    nsec3_rounds: int = 30,
+    nsec3_rounds: Optional[int] = 100,
     wordlist: Optional[list[str]] = None,
 ) -> dict:
     """
-    Run a full DNSSEC zone-walking test against *domain*.
+    Run a full DNSSEC zone-walking assessment against *domain*.
 
-    For NSEC zones  -> follows the NSEC chain and returns discovered names.
-    For NSEC3 zones -> collects hashes, then:
-        - If wordlist provided: attempts cracking, writes uncracked hashes to
-          <domain>_nsec3.hashes for offline GPU cracking.
-        - If no wordlist:       writes all hashes to <domain>_nsec3.hashes.
+    NSEC zones  → follows the NSEC chain; returns all discovered owner names.
+    NSEC3 zones → walks the hash ring to collect all hashes, then:
+                  - with wordlist:    attempts cracking; exports uncracked hashes.
+                  - without wordlist: exports all hashes for offline cracking.
 
     Parameters
     ----------
     domain       : Zone apex to test (e.g. "example.com").
-    max_steps    : Maximum NSEC hops to follow.
-    nameserver   : Optional resolver IP; uses the system resolver when None.
-    nsec3_rounds : Number of random probes for NSEC3 hash collection.
-    wordlist     : List of candidate labels for NSEC3 cracking. When None,
-                   skips cracking and writes all hashes to the output file.
+    max_steps    : Maximum NSEC hops before giving up.
+    nameserver   : Force a specific resolver IP; uses system resolver when None.
+    nsec3_rounds : Maximum active-walk rounds for NSEC3 hash collection.
+    wordlist     : Candidate labels for NSEC3 cracking (None = skip cracking).
 
     Returns
     -------
     dict with keys:
-        "nsec_type"   : "NSEC" | "NSEC3" | "UNKNOWN" | "NONE"
-        "nsec_names"  : list[dict]        -- discovered names (NSEC path)
-        "nsec3"       : Nsec3WalkResult | None
+        "nsec_type"  : "NSEC" | "NSEC3" | "UNKNOWN" | "NONE"
+        "nsec_names" : list[dict]          — discovered names (NSEC path only)
+        "nsec3"      : Nsec3WalkResult | None
     """
     domain = domain.strip().rstrip(".")
     resolver = make_resolver(nameserver)
-
     SEP = "=" * 60
+
     log.info(SEP)
-    log.info("DNSSEC Zone Walking Tester")
+    log.info("ZoneRipper — DNSSEC Zone Walking Tester")
     log.info("Target     : %s", domain)
     if nameserver:
         log.info("Nameserver : %s", nameserver)
     log.info(SEP)
 
-    # -- 1. DNSSEC enabled? --------------------------------------
-    log.info("[1] Querying DNSKEY records...")
+    # 1. Confirm DNSSEC is enabled --------------------------------
+    log.info("[1] Checking for DNSKEY records...")
     if not check_dnssec_enabled(domain, resolver):
-        log.warning("No DNSKEY found - DNSSEC is NOT enabled on '%s'.", domain)
+        log.warning("No DNSKEY found — DNSSEC is NOT enabled on '%s'.", domain)
         log.warning("Zone walking requires DNSSEC; nothing to test.")
         return {"nsec_type": "NONE", "nsec_names": [], "nsec3": None}
-    log.info("DNSKEY records present - DNSSEC is ENABLED.")
+    log.info("DNSKEY present — DNSSEC is ENABLED.")
 
-    # -- 2. Resolve authoritative NS -----------------------------
+    # 2. Resolve authoritative nameservers ------------------------
     log.info("[2] Resolving authoritative nameservers...")
     ns_ips = get_zone_nameserver_ips(domain, resolver)
     if not ns_ips:
@@ -918,14 +951,20 @@ def run(
     else:
         log.info("Authoritative NS IPs: %s", ", ".join(ns_ips))
 
-    # -- 3. NSEC vs NSEC3 ----------------------------------------
+    # 3. Detect NSEC vs NSEC3 -------------------------------------
     log.info("[3] Detecting denial-of-existence mechanism...")
     nsec_type = detect_nsec_type(domain, ns_ips[0])
+    log.info("Detected: %s", nsec_type)
 
-    # -- 4a. NSEC walk -------------------------------------------
+    # 4a. NSEC — plain zone walk ----------------------------------
     if nsec_type == "NSEC":
-        log.warning("Plain NSEC detected - potentially VULNERABLE to zone walking!")
-        log.info("[4] Attempting NSEC zone walk...")
+        log.warning(
+            "Plain NSEC detected — zone is potentially VULNERABLE to enumeration."
+        )
+        log.info(
+            "[4] Attempting NSEC zone walk (%s)...",
+            f"max {max_steps} steps" if max_steps is not None else "unlimited steps",
+        )
         discovered = walk_zone(domain, ns_ips, max_steps=max_steps)
 
         log.info("[5] Results")
@@ -935,34 +974,33 @@ def run(
             log.info("%-48s  RR Types", "Hostname")
             log.info("%s  %s", "-" * 48, "--------")
             for entry in discovered:
-                types_str = ", ".join(entry["types"]) if entry["types"] else "-"
-                log.info("%-48s  %s", entry["name"], types_str)
-            log.warning("Verdict: VULNERABLE - zone walking succeeded on '%s'.", domain)
-            log.warning("Remediation: Migrate to NSEC3 (RFC 5155) with opt-out.")
+                log.info("%-48s  %s", entry["name"], ", ".join(entry["types"]) or "-")
+            log.warning("Verdict: VULNERABLE — zone walking succeeded on '%s'.", domain)
+            log.warning("Remediation: migrate to NSEC3 with opt-out (RFC 5155).")
         else:
             log.info("No names enumerated via zone walking.")
-            log.info("Verdict: No zone walking exposure detected on '%s'.", domain)
+            log.info("Verdict: no zone walking exposure detected on '%s'.", domain)
         log.info(SEP)
-
         return {"nsec_type": "NSEC", "nsec_names": discovered, "nsec3": None}
 
-    # -- 4b. NSEC3 hash collection + cracking --------------------
-    elif nsec_type == "NSEC3":
-        log.info("NSEC3 detected - collecting hashes...")
-        log.info("[4] Collecting NSEC3 hashes via %d random probes...", nsec3_rounds)
-
+    # 4b. NSEC3 — hash collection + optional cracking -------------
+    if nsec_type == "NSEC3":
+        log.info(
+            "[4] Collecting NSEC3 hashes (%s)...",
+            f"max {nsec3_rounds} rounds"
+            if nsec3_rounds is not None
+            else "unlimited rounds",
+        )
         nsec3_result = collect_nsec3_hashes(domain, ns_ips, rounds=nsec3_rounds)
         export_path = f"{domain}_nsec3.hashes"
 
         if wordlist:
-            # Wordlist provided: crack, then write only uncracked hashes
             log.info("[5] Attempting dictionary crack of NSEC3 hashes...")
             crack_nsec3_hashes(nsec3_result, domain, wordlist=wordlist)
 
             log.info("[6] Results")
             log.info(SEP)
-            log.info("Collected %d unique NSEC3 hashes.", len(nsec3_result.hashes))
-
+            log.info("Collected %d unique NSEC3 hash(es).", len(nsec3_result.hashes))
             if nsec3_result.cracked:
                 log.warning(
                     "Cracked %d / %d hash(es):",
@@ -970,37 +1008,31 @@ def run(
                     len(nsec3_result.hashes),
                 )
                 for b32, label in nsec3_result.cracked.items():
-                    log.warning("  %s  ->  %s.%s", b32, label, domain)
+                    log.warning("  %s  →  %s.%s", b32, label, domain)
+                log.warning(
+                    "Verdict: NSEC3 hashes partially reversed — subdomain names exposed."
+                )
 
-            uncracked_count = len(nsec3_result.hashes) - len(nsec3_result.cracked)
-            if uncracked_count > 0:
+            uncracked = len(nsec3_result.hashes) - len(nsec3_result.cracked)
+            if uncracked:
                 export_hashcat_file(
                     nsec3_result, domain, export_path, uncracked_only=True
                 )
             else:
-                log.info("All hashes cracked - no output file written.")
-
-            if nsec3_result.cracked:
-                log.warning(
-                    "Verdict: NSEC3 hashes partially reversed - subdomain names exposed."
-                )
+                log.info("All hashes cracked — no output file written.")
         else:
-            # No wordlist: write all hashes for offline cracking
-            log.info(
-                "[5] No wordlist provided - writing all hashes for offline cracking."
-            )
+            log.info("[5] No wordlist — writing all hashes for offline cracking.")
             log.info("[6] Results")
             log.info(SEP)
-            log.info("Collected %d unique NSEC3 hashes.", len(nsec3_result.hashes))
+            log.info("Collected %d unique NSEC3 hash(es).", len(nsec3_result.hashes))
             export_hashcat_file(nsec3_result, domain, export_path, uncracked_only=False)
 
         log.info(SEP)
         return {"nsec_type": "NSEC3", "nsec_names": [], "nsec3": nsec3_result}
 
-    # -- Unknown -------------------------------------------------
-    else:
-        log.warning("Could not detect NSEC type for '%s'.", domain)
-        return {"nsec_type": "UNKNOWN", "nsec_names": [], "nsec3": None}
+    # Unknown / no denial-of-existence records --------------------
+    log.warning("Could not detect NSEC type for '%s'.", domain)
+    return {"nsec_type": "UNKNOWN", "nsec_names": [], "nsec3": None}
 
 
 # ─────────────────────────────────────────────────────────────
@@ -1009,53 +1041,76 @@ def run(
 
 
 def parse_args(argv: Optional[list[str]] = None) -> argparse.Namespace:
-    """Build and return parsed CLI arguments."""
     parser = argparse.ArgumentParser(
-        description="Test DNSSEC zone walking vulnerability.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        prog="zoneripper",
+        description=(
+            "ZoneRipper — DNSSEC Zone Walking Tester\n"
+            "\n"
+            "Probes a domain for DNSSEC zone-walking exposure:\n"
+            "  NSEC zones  : enumerates all owner names by following the NSEC chain.\n"
+            "  NSEC3 zones : collects all hashes via active gap-targeted walk,\n"
+            "                then optionally cracks them via dictionary attack.\n"
+            "\n"
+            "Examples:\n"
+            "  zoneripper example.com\n"
+            "  zoneripper example.com -n 8.8.8.8 -w wordlist.txt\n"
+            "  zoneripper example.com -r 0              # unlimited rounds\n"
+            "  zoneripper example.com -l DEBUG\n"
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    parser.add_argument("domain", help="Target domain, e.g. example.com")
+
     parser.add_argument(
-        "--max-steps",
-        type=int,
-        default=50,
-        metavar="N",
-        help="Max NSEC hops to follow",
+        "domain",
+        metavar="DOMAIN",
+        help="Target zone apex (e.g. example.com)",
     )
     parser.add_argument(
+        "-n",
         "--nameserver",
         metavar="IP",
-        help="Force a specific resolver IP (default: system resolver)",
+        help="Authoritative nameserver IP to query (default: system resolver)",
     )
     parser.add_argument(
-        "--nsec3-rounds",
-        type=int,
-        default=100,
-        metavar="N",
-        help="Number of random probes for NSEC3 hash collection",
-    )
-    parser.add_argument(
+        "-w",
         "--wordlist",
         metavar="FILE",
         help=(
             "Wordlist for NSEC3 hash cracking. "
             "Uncracked hashes are written to <domain>_nsec3.hashes. "
-            "Without this flag, all hashes are written to <domain>_nsec3.hashes."
+            "Without this flag all hashes are written to that file."
         ),
     )
     parser.add_argument(
+        "-s",
+        "--max-steps",
+        type=int,
+        default=50,
+        metavar="N",
+        help="Max NSEC hops to follow; 0 = unlimited (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-r",
+        "--nsec3-rounds",
+        type=int,
+        default=100,
+        metavar="N",
+        help="Max NSEC3 walk rounds; 0 = unlimited (default: %(default)s)",
+    )
+    parser.add_argument(
+        "-l",
         "--log-level",
         default="INFO",
         choices=["DEBUG", "INFO", "WARNING", "ERROR"],
-        help="Logging verbosity",
+        metavar="LEVEL",
+        help="Logging verbosity: DEBUG INFO WARNING ERROR (default: %(default)s)",
     )
+
     return parser.parse_args(argv)
 
 
 def main(argv: Optional[list[str]] = None) -> None:
-    """CLI entry point - parses arguments and delegates to run()."""
     args = parse_args(argv)
-
     logging.basicConfig(
         level=getattr(logging, args.log_level),
         format="%(levelname)-8s %(message)s",
@@ -1066,15 +1121,15 @@ def main(argv: Optional[list[str]] = None) -> None:
         if not os.path.isfile(args.wordlist):
             log.error("Wordlist file not found: %s", args.wordlist)
             sys.exit(1)
-        with open(args.wordlist, "r", encoding="latin-1") as f:
-            wordlist = [line.strip() for line in f if line.strip()]
-        log.info("Loaded %d words from '%s'.", len(wordlist), args.wordlist)
+        with open(args.wordlist, encoding="latin-1") as fh:
+            wordlist = [line.strip() for line in fh if line.strip()]
+        log.info("Loaded %d word(s) from '%s'.", len(wordlist), args.wordlist)
 
     run(
         domain=args.domain,
-        max_steps=args.max_steps,
+        max_steps=args.max_steps or None,
         nameserver=args.nameserver,
-        nsec3_rounds=args.nsec3_rounds,
+        nsec3_rounds=args.nsec3_rounds or None,
         wordlist=wordlist,
     )
 

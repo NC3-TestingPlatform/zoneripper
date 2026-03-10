@@ -302,26 +302,39 @@ def check_dnssec_enabled(domain: str, resolver: dns.resolver.Resolver) -> bool:
         return False
 
 
-def detect_nsec_type(domain: str, ns_ip: str, timeout: float = 5.0) -> str:
+def detect_nsec_type(
+    domain: str,
+    ns_ips: list[str],
+    timeout: float = 5.0,
+) -> tuple[str, Optional[str]]:
     """
-    Determine whether the zone uses NSEC or NSEC3 for denial-of-existence.
+    Probe all authoritative NS IPs and return the first one that responds
+    with NSEC or NSEC3 records.
 
-    Sends a query for a guaranteed-nonexistent name and inspects the authority
-    section of the NXDOMAIN response for NSEC / NSEC3 records.
-
-    Returns: "NSEC" | "NSEC3" | "UNKNOWN"
+    Returns (nsec_type, ns_ip) where nsec_type is "NSEC" | "NSEC3" | "UNKNOWN"
+    and ns_ip is the responding nameserver IP, or None if none responded.
     """
     probe = f"_zzzonewalk_probe_99_.{domain}"
-    response = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
-    if response is None:
-        return "UNKNOWN"
 
-    rdtypes = {rrset.rdtype for rrset in response.authority}
-    if dns.rdatatype.NSEC3 in rdtypes:
-        return "NSEC3"
-    if dns.rdatatype.NSEC in rdtypes:
-        return "NSEC"
-    return "UNKNOWN"
+    for ns_ip in ns_ips:
+        log.debug("Probing %s for denial-of-existence type...", ns_ip)
+        response = udp_query(probe, dns.rdatatype.A, ns_ip, timeout)
+        if response is None:
+            log.debug("  %s — no response", ns_ip)
+            continue
+
+        rdtypes = {rrset.rdtype for rrset in response.authority}
+
+        if dns.rdatatype.NSEC3 in rdtypes:
+            log.debug("  %s — NSEC3 detected", ns_ip)
+            return "NSEC3", ns_ip
+        if dns.rdatatype.NSEC in rdtypes:
+            log.debug("  %s — NSEC detected", ns_ip)
+            return "NSEC", ns_ip
+
+        log.debug("  %s — no NSEC/NSEC3 in authority section", ns_ip)
+
+    return "UNKNOWN", None
 
 
 # ─────────────────────────────────────────────────────────────
@@ -953,8 +966,13 @@ def run(
 
     # 3. Detect NSEC vs NSEC3 -------------------------------------
     log.info("[3] Detecting denial-of-existence mechanism...")
-    nsec_type = detect_nsec_type(domain, ns_ips[0])
-    log.info("Detected: %s", nsec_type)
+    nsec_type, nsec_ns_ip = detect_nsec_type(domain, ns_ips)
+    log.info("Detected: %s (via %s)", nsec_type, nsec_ns_ip or "none")
+
+    # Put the responding NS first so all subsequent queries prefer it
+    if nsec_ns_ip and nsec_ns_ip in ns_ips and ns_ips[0] != nsec_ns_ip:
+        ns_ips.remove(nsec_ns_ip)
+        ns_ips.insert(0, nsec_ns_ip)
 
     # 4a. NSEC — plain zone walk ----------------------------------
     if nsec_type == "NSEC":

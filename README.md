@@ -4,6 +4,9 @@
 
 It automatically detects whether a DNS zone uses **NSEC** or **NSEC3**, performs **NSEC zone enumeration**, and can **actively collect NSEC3 hashes** for dictionary cracking or GPU cracking using **Hashcat**.
 
+![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
+![License](https://img.shields.io/badge/license-GPLv3-lightgrey)
+
 ---
 
 # Features

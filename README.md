@@ -271,3 +271,9 @@ ZoneRipper is useful for:
 * Large hash sets should be exported to **Hashcat**
 * Only **SHA-1 NSEC3 (RFC 5155)** is supported
 * Very large zones may require many collection rounds
+
+---
+
+## License
+
+GPLv3 — see [LICENSE](LICENSE) for details.

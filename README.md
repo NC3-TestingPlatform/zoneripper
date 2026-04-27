@@ -1,25 +1,42 @@
-# ZoneRipper
+# zoneripper
 
-**ZoneRipper** is a Python tool for assessing **DNSSEC zone-walking exposure**.
+> Assess DNSSEC zone-walking exposure — from the command line or as a Python library.
 
-It automatically detects whether a DNS zone uses **NSEC** or **NSEC3**, performs **NSEC zone enumeration**, and can **actively collect NSEC3 hashes** for dictionary cracking or GPU cracking using **Hashcat**.
+**zoneripper** automatically detects whether a DNS zone uses **NSEC** or **NSEC3**, walks the
+NSEC chain to enumerate all owner names, collects NSEC3 hashes via a gap-targeted active walk,
+and exports uncracked hashes in **Hashcat mode 8300** format for GPU cracking.
+
+```
+$ python3 zoneripper.py example.com
+```
 
 ![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-lightgrey)
 
 ---
 
-# Features
+## Contents
 
-## DNSSEC Detection
-
-ZoneRipper first checks whether DNSSEC is enabled by querying for **DNSKEY records** at the zone apex.
-
-If DNSSEC is not enabled, zone walking is not possible.
+- [Features](#features)
+- [Requirements](#requirements)
+- [Installation](#installation)
+- [CLI Usage](#cli-usage)
+- [Python API](#python-api)
+- [Security Implications](#security-implications)
+- [Use Cases](#use-cases)
+- [Limitations](#limitations)
+- [Contributing](#contributing)
 
 ---
 
-## NSEC Zone Walking
+## Features
+
+### DNSSEC Detection
+
+zoneripper first checks whether DNSSEC is enabled by querying for **DNSKEY records** at the zone apex.
+If DNSSEC is not enabled, zone walking is not possible.
+
+### NSEC Zone Walking
 
 If a zone uses **plain NSEC**, the tool:
 
@@ -31,11 +48,9 @@ If a zone uses **plain NSEC**, the tool:
 
 Plain NSEC allows **full zone enumeration**.
 
----
+### NSEC3 Hash Collection
 
-## NSEC3 Hash Collection
-
-For zones using **NSEC3**, ZoneRipper performs an **active gap-targeted hash walk**:
+For zones using **NSEC3**, zoneripper performs an **active gap-targeted hash walk**:
 
 1. Bootstrap the hash ring using a deterministic probe
 2. Track discovered hash intervals
@@ -43,45 +58,21 @@ For zones using **NSEC3**, ZoneRipper performs an **active gap-targeted hash wal
 4. Generate candidate labels whose hashes fall into those gaps
 5. Query DNS to collect additional NSEC3 records
 
-This technique efficiently reconstructs the **entire NSEC3 hash ring**.
+Collected data includes the hashing algorithm, iteration count, salt, owner hash, next hash, and record types.
 
-Collected data includes:
+### NSEC3 Hash Cracking
 
-* hashing algorithm
-* iteration count
-* salt
-* owner hash
-* next hash
-* record types
-
----
-
-## NSEC3 Hash Cracking
-
-ZoneRipper includes a **pure Python NSEC3 hashing implementation** based on RFC 5155.
-
-It supports dictionary attacks to recover plaintext subdomain labels.
-
-Features:
-
-* automatic DNS label validation
-* iteration-aware hashing
-* salt handling
-* cracked subdomain reporting
-
-Example output:
+zoneripper includes a **pure Python NSEC3 hashing implementation** based on RFC 5155.
+It supports dictionary attacks to recover plaintext subdomain labels, with automatic DNS label
+validation, iteration-aware hashing, and salt handling.
 
 ```
 CRACKED: 9CLK...FOJ → admin.example.com
 ```
 
----
+### Hashcat Export
 
-## Hashcat Export
-
-For large datasets, hashes can be exported for **GPU cracking**.
-
-Export format follows **Hashcat mode 8300**:
+For large datasets, hashes can be exported in **Hashcat mode 8300** format:
 
 ```
 <hash>:<.zone>:<salt>:<iterations>
@@ -93,113 +84,69 @@ Example:
 9clkef9t1cpn5jp5ltaohtp49dqi9foj:.example.com:73:0
 ```
 
-Crack using:
+Crack with:
 
-```
+```bash
 hashcat -m 8300 example.com_nsec3.hashes wordlist.txt --keep-guessing
 ```
 
----
+### Robust Resolver Logic
 
-## Robust Resolver Logic
-
-ZoneRipper improves reliability by:
-
-* resolving **all authoritative nameservers**
-* rotating queries across nameservers
-* handling **anycast DNS infrastructures**
-* retrying unresponsive nodes
+* Resolves **all authoritative nameservers** for the zone
+* Rotates queries across nameservers
+* Handles **anycast DNS infrastructures**
+* Retries unresponsive nodes
 
 ---
 
-# Installation
+## Requirements
 
-Requirements:
+- Python ≥ 3.11
+- [`dnspython`](https://www.dnspython.org/) ≥ 2.6
 
-* Python **3.8+**
+---
 
-Install dependency:
-
-```bash
-pip install dnspython
-```
-
-Clone the repository:
+## Installation
 
 ```bash
-git clone https://github.com/t0kubetsu/zoneripper.git
+git clone https://github.com/NC3-TestingPlatform/zoneripper.git
 cd zoneripper
+python -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 ```
 
 ---
 
-# Usage
+## CLI Usage
 
-## Basic Scan
+### Basic scan
 
-```
+```bash
 python3 zoneripper.py example.com
 ```
 
-The tool will:
+The tool detects DNSSEC, identifies NSEC/NSEC3, then attempts enumeration or hash collection.
 
-1. Detect DNSSEC
-2. Identify NSEC/NSEC3
-3. Attempt enumeration or hash collection
+### Common options
 
----
-
-## Limit NSEC Walk Steps
-
-Limit the number of NSEC hops:
-
-```
-python3 zoneripper.py example.com --max-steps 100
-```
-
-Use `0` for unlimited.
-
----
-
-## Specify a Nameserver
-
-Use a specific resolver or authoritative server:
-
-```
+```bash
+# Use a specific resolver or authoritative nameserver
 python3 zoneripper.py example.com --nameserver 8.8.8.8
-```
 
----
+# Limit the number of NSEC walk steps (0 = unlimited)
+python3 zoneripper.py example.com --max-steps 100
 
-## Increase NSEC3 Collection Rounds
-
-```
+# Increase NSEC3 collection rounds (0 = unlimited)
 python3 zoneripper.py example.com --nsec3-rounds 200
-```
 
-Use `0` for unlimited rounds.
-
----
-
-## Crack NSEC3 Hashes
-
-```
+# Dictionary-attack NSEC3 hashes; uncracked hashes exported to example.com_nsec3.hashes
 python3 zoneripper.py example.com --wordlist rockyou.txt
 ```
 
-Uncracked hashes will be exported to:
-
-```
-example.com_nsec3.hashes
-```
-
 ---
 
-# Python API Usage
-
-ZoneRipper can also be used as a **Python library**.
-
-Example:
+## Python API
 
 ```python
 from zoneripper import run
@@ -207,73 +154,62 @@ from zoneripper import run
 results = run(
     "example.com",
     max_steps=100,
-    nameserver="8.8.8.8"
+    nameserver="8.8.8.8",
 )
-
-print(results)
 ```
 
 Returned structure:
 
-```
+```python
 {
     "nsec_type": "NSEC | NSEC3 | NONE | UNKNOWN",
     "nsec_names": [...],
-    "nsec3": Nsec3WalkResult
+    "nsec3": Nsec3WalkResult,
 }
 ```
 
 ---
 
-# Security Implications
+## Security Implications
 
-## NSEC
+### NSEC
 
-Plain **NSEC** exposes the full zone contents.
+Plain **NSEC** exposes the full zone contents. Attackers may discover internal services,
+staging environments, forgotten subdomains, and hidden infrastructure.
 
-Attackers may discover:
+Recommended mitigation: use **NSEC3 with opt-out**.
 
-* internal services
-* staging environments
-* forgotten subdomains
-* hidden infrastructure
+### NSEC3
 
-Recommended mitigation:
-
-```
-Use NSEC3 with opt-out
-```
+NSEC3 reduces enumeration but may still leak names if weak dictionary words are used,
+the iteration count is low, or predictable subdomains exist.
 
 ---
 
-## NSEC3
-
-NSEC3 reduces enumeration but may still leak names if:
-
-* weak dictionary words are used
-* iteration count is low
-* predictable subdomains exist
-
----
-
-# Use Cases
-
-ZoneRipper is useful for:
+## Use Cases
 
 * DNS security assessments
-* penetration testing
-* red team reconnaissance
-* bug bounty research
+* Penetration testing
+* Red team reconnaissance
+* Bug bounty research
 * DNSSEC deployment verification
 
 ---
 
-# Limitations
+## Limitations
 
-* NSEC3 cracking is **CPU-only in Python**
-* Large hash sets should be exported to **Hashcat**
+* NSEC3 cracking is **CPU-only in Python** — export to Hashcat for large hash sets
 * Only **SHA-1 NSEC3 (RFC 5155)** is supported
 * Very large zones may require many collection rounds
+
+---
+
+## Contributing
+
+1. Fork the repository and create a feature branch.
+2. Test your changes manually against NSEC and NSEC3 zones.
+3. Use [conventional commits](https://www.conventionalcommits.org/):
+   `fix:`, `feat:`, `refactor:`, `docs:`, `chore:`
 
 ---
 

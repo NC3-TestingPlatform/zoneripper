@@ -1,3 +1,54 @@
-.venv
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.so
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+.eggs/
+lib/
+lib64/
+sdist/
+wheels/
+*.whl
+*.manifest
+*.spec
+MANIFEST
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+.env
+
+# Testing & coverage
+.pytest_cache/
+.coverage
+.coverage.*
+coverage.json
+htmlcov/
+*.xml
+junit/
+
+# IDEs
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# Claude Code
+.claude/
+.ecc
+
+# Tool output
 *.hashes
 *.old

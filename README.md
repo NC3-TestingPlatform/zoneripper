@@ -13,6 +13,8 @@ $ python3 zoneripper.py example.com
 ![Python](https://img.shields.io/badge/python-%3E%3D3.11-blue)
 ![License](https://img.shields.io/badge/license-GPLv3-lightgrey)
 
+Part of the [NC3-TestingPlatform](https://github.com/NC3-TestingPlatform).
+
 ---
 
 ## Contents
